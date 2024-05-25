@@ -1,7 +1,7 @@
 import numpy as np
 import scipy.io as sio
 from sklearn.metrics import accuracy_score, confusion_matrix
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import OneHotEncoder, Normalizer
 import tensorflow as tf
 from tensorflow import keras
@@ -9,6 +9,7 @@ from tensorflow.keras.layers import LSTM, Dense, Bidirectional, Conv1D
 from tensorflow.keras.optimizers import Adam
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sdv.tabular import CopulaGAN
 
 np.random.seed(0)
 
@@ -129,113 +130,43 @@ tec = Normalizer().fit(tec).transform(tec)
 trc = trc.reshape(len(trc), 1, len(trc[0]))
 tec = tec.reshape(len(tec), 1, len(tec[0]))
 
-trc_finger_nonhotencoded = np.argmax(trf, axis=1)
-tec_finger_nonhotencoded = np.argmax(tef, axis=1)
+# Stratified K-Fold Cross Validation and Bootstrapping
+n_splits = 5
+n_bootstrap_samples = 5
+skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
-state_indices = [[] for _ in range(6)]
-for i, state in enumerate(trc_finger_nonhotencoded):
-    state_indices[state].append(i)
+all_x_train = []
+all_y_train = []
 
-min_count = min(len(indices) for indices in state_indices)
+for train_index, _ in skf.split(trc, trf.argmax(axis=1)):
+    X_stratified = trc[train_index]
+    y_stratified = trf[train_index]
+    for _ in range(n_bootstrap_samples):
+        indices = np.random.choice(train_index, len(train_index), replace=True)
+        X_bootstrap = trc[indices]
+        y_bootstrap = trf[indices]
+        all_x_train.append(X_bootstrap)
+        all_y_train.append(y_bootstrap)
 
-balanced_indices = []
-for indices in state_indices:
-    selected_indices = np.random.choice(indices, min_count, replace=False)
-    balanced_indices.extend(selected_indices)
+x_train_extended = np.vstack(all_x_train)
+y_train_extended = np.vstack(all_y_train)
 
-trc_balanced = trc[balanced_indices]
-trf_balanced = trf[balanced_indices]
+# Generating synthetic data using CopulaGAN
+data_for_gan = np.hstack((x_train_extended.squeeze(), y_train_extended))
 
-x_train, x_test, y_train, y_test = train_test_split(
-    trc_balanced, trf_balanced, test_size=0.2, random_state=42)
+copula_gan = CopulaGAN()
+copula_gan.fit(data_for_gan)
 
-x_test_original = tec
-y_test_original = tef
+num_synthetic_samples = len(x_train_extended)
+synthetic_data = copula_gan.sample(num_synthetic_samples)
 
-x_test_balanced = x_test_original
-y_test_balanced = y_test_original
+x_synthetic = synthetic_data[:, :-y_train_extended.shape[1]].reshape(-1, 1, trc.shape[2])
+y_synthetic = synthetic_data[:, -y_train_extended.shape[1]:]
 
-gen_input_shape = 100
-gen_output_shape = trc.shape[2]
+x_train_combined = np.vstack((x_train_extended, x_synthetic))
+y_train_combined = np.vstack((y_train_extended, y_synthetic))
 
-disc_input_shape = (gen_output_shape,)
-disc_output_shape = 1
-
-gen_learning_rate = 0.0002
-disc_learning_rate = 0.0002
-
-initializer = tf.random_normal_initializer(mean=0.0, stddev=0.02)
-
-generator = keras.Sequential([
-    keras.layers.Dense(256, input_shape=(gen_input_shape,), kernel_initializer=initializer),
-    keras.layers.LeakyReLU(alpha=0.2),
-    keras.layers.Dense(512),
-    keras.layers.LeakyReLU(alpha=0.2),
-    keras.layers.Dense(1024),
-    keras.layers.LeakyReLU(alpha=0.2),
-    keras.layers.Dense(gen_output_shape, activation='tanh')
-], name='Generator')
-
-discriminator = keras.Sequential([
-    keras.layers.Dense(1024, input_shape=disc_input_shape, kernel_initializer=initializer),
-    keras.layers.LeakyReLU(alpha=0.2),
-    keras.layers.Dropout(0.3),
-    keras.layers.Dense(512),
-    keras.layers.LeakyReLU(alpha=0.2),
-    keras.layers.Dropout(0.3),
-    keras.layers.Dense(256),
-    keras.layers.LeakyReLU(alpha=0.2),
-    keras.layers.Dropout(0.3),
-    keras.layers.Dense(disc_output_shape, activation='sigmoid')
-], name='Discriminator')
-
-gan = keras.Sequential([generator, discriminator])
-
-discriminator.compile(loss='wasserstein_loss', optimizer=Adam(lr=disc_learning_rate), metrics=['accuracy'])
-
-gan.compile(loss='wasserstein_loss', optimizer=Adam(lr=gen_learning_rate))
-
-epochs = 200
-batch_size = 128
-
-discriminator_losses = []
-generator_losses = []
-
-for epoch in range(epochs):
-    noise = np.random.normal(0, 1, size=[batch_size, 100])
-    generated_samples = generator.predict(noise)
-    idx = np.random.randint(0, x_train.shape[0], batch_size)
-    real_samples = x_train[idx]
-    real_samples = real_samples.reshape(batch_size, 64)
-    x = np.concatenate([real_samples, generated_samples], axis=0)
-    y_discriminator = np.zeros(2 * batch_size)
-    y_discriminator[:batch_size] = 0.9
-    discriminator_loss = discriminator.train_on_batch(x, y_discriminator)
-    noise = np.random.normal(0, 1, size=[batch_size, 100])
-    y_generator = np.ones(batch_size)
-    generator_loss = gan.train_on_batch(noise, y_generator)
-    if (epoch + 1) % 10 == 0:
-        print(f"Epoch {epoch + 1}/{epochs}, Discriminator Loss: {discriminator_loss}, Generator Loss: {generator_loss}")
-    discriminator_losses.append(discriminator_loss)
-    generator_losses.append(generator_loss)
-
-plt.figure()
-plt.plot(range(1, epochs + 1), discriminator_losses, label='Discriminator Loss')
-plt.plot(range(1, epochs + 1), generator_losses, label='Generator Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.legend()
-plt.savefig('GAN_Losses.png')
-
-num_synthetic_samples = len(x_train)
-noise = np.random.normal(0, 1, size=[num_synthetic_samples, 100])
-synthetic_samples = generator.predict(noise)
-synthetic_samples = np.expand_dims(synthetic_samples, axis=2)
-synthetic_samples = synthetic_samples.reshape(synthetic_samples.shape[0], 1, synthetic_samples.shape[1])
-x_train_extended = np.concatenate([x_train, synthetic_samples], axis=0)
-x_train_extended = x_train_extended.reshape(x_train_extended.shape[0], x_train.shape[1], x_train.shape[2])
-y_train_extended = np.concatenate([y_train, y_train[:num_synthetic_samples]])
-
+# Model architecture and training
 input = keras.Input(shape=(1, 64))
 conv = Conv1D(64, 1, activation='relu')
 layer = conv(input)
@@ -247,14 +178,15 @@ output = Dense(6, activation='softmax')(layer)
 model = keras.Model(inputs=input, outputs=output, name="CNN-BiLSTM-BCI")
 
 opt = keras.optimizers.Adam(learning_rate=0.005)
-model.compile(loss='wasserstein_loss', optimizer=opt, metrics=['accuracy'])
+model.compile(loss='categorical_crossentropy', optimizer=opt, metrics=['accuracy'])
 model.summary()
 
-history = model.fit(x_train_extended, y_train_extended, batch_size=128, epochs=100, validation_split=0.05, verbose=1)
+history = model.fit(x_train_combined, y_train_combined, batch_size=128, epochs=100, validation_split=0.05, verbose=1)
 
-predictions_original = model.predict(x_test_original)
+# Evaluation
+predictions_original = model.predict(tec)
 predictions_original = np.argmax(predictions_original, axis=1)
-true_labels_original = np.argmax(y_test_original, axis=1)
+true_labels_original = np.argmax(tef, axis=1)
 accuracy_original = accuracy_score(true_labels_original, predictions_original)
 confusion_mat_original = confusion_matrix(true_labels_original, predictions_original)
 
@@ -299,12 +231,4 @@ plt.xlabel('Epoch')
 plt.ylabel('Loss')
 plt.legend()
 plt.savefig('Loss_vs_Epoch.png')
-
-plt.savefig('GAN_Losses.png')
-plt.savefig('Confusion_Matrix_Original.png')
-plt.savefig('Confusion_Matrix_Balanced.png')
-plt.savefig('Accuracy_vs_Epoch.png')
-plt.savefig('Loss_vs_Epoch.png')
-
-
 
